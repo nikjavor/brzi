@@ -22,7 +22,7 @@
   "idf.openOcdConfigs": [
     "board/esp32c6-builtin.cfg"
   ],
-  "idf.port": "detect",
+  "idf.port": "/dev/tty.usbmodem1101",
   "idf.currentSetup": "/Users/nikjavor/.espressif/v6.1/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c6"
@@ -32,5 +32,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=/Users/nikjavor/repos/brzi/build"
-  ]
+  ],
+  "idf.flashType": "UART"
 }
