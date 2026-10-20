@@ -76,7 +76,7 @@ static void scheduler_task(void *arg)
   {
     now = pdTICKS_TO_MS(xTaskGetTickCount());
 
-    if ((now - last_summary_ms) >= 100)
+    if ((now - last_summary_ms) >= 100) // Summary logging interval
     {
       last_summary_ms = now;
 
@@ -87,6 +87,9 @@ static void scheduler_task(void *arg)
                  (int)car.engine.rpm.value, car.engine.rpm.valid,
                  (int)car.engine.speed_kph.value, car.engine.speed_kph.valid,
                  (int)car.engine.throttle_pct.value, car.engine.throttle_pct.valid);
+
+        ESP_LOGI(TAG, "RX queue drops=%lu",
+                 (unsigned long)obd_twai_get_rx_drop_count());
       }
     }
 

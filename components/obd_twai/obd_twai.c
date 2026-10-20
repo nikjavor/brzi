@@ -27,6 +27,8 @@ static obd_twai_config_t s_config;
 
 static uint32_t s_detected_bitrate = 0;
 static volatile uint32_t s_rx_count = 0;
+static uint32_t s_rx_drop_count = 0;
+static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct
 {
@@ -160,7 +162,14 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
     memcpy(&item.data, rx_frame.buffer, item.len);
 
     BaseType_t hp_task_woken = pdFALSE;
-    xQueueSendFromISR(s_data_queue, &item, &hp_task_woken);
+
+    if (!item.ide && item.id >= 0x7E8 && item.id <= 0x7EF)
+        if (xQueueSendFromISR(s_data_queue, &item, &hp_task_woken) != pdTRUE)
+        {
+            portENTER_CRITICAL_ISR(&s_stats_lock);
+            s_rx_drop_count++;
+            portEXIT_CRITICAL_ISR(&s_stats_lock);
+        }
 
     return hp_task_woken == pdTRUE;
 }
@@ -289,12 +298,13 @@ static bool send_pid_request(uint8_t service, uint8_t pid)
         .buffer_len = sizeof(send_buff),
     };
 
-    if (twai_node_transmit(s_node_hdl, &tx_msg, 10) != ESP_OK)
-    {
+    if (twai_node_transmit_wait_all_done(s_node_hdl, 0) != ESP_OK)
         return false;
-    }
 
-    return ESP_OK == twai_node_transmit_wait_all_done(s_node_hdl, 10);
+    if (twai_node_transmit(s_node_hdl, &tx_msg, 10) != ESP_OK)
+        return false;
+
+    return twai_node_transmit_wait_all_done(s_node_hdl, 10) == ESP_OK;
 }
 
 static bool wait_response(uint8_t service, uint8_t pid, uint8_t *out, size_t *out_len, TickType_t timeout)
@@ -338,6 +348,15 @@ static bool wait_response(uint8_t service, uint8_t pid, uint8_t *out, size_t *ou
     }
 
     return false;
+}
+
+uint32_t obd_twai_get_rx_drop_count(void)
+{
+    portENTER_CRITICAL(&s_stats_lock);
+    uint32_t count = s_rx_drop_count;
+    portEXIT_CRITICAL(&s_stats_lock);
+
+    return count;
 }
 
 static bool decode_rpm(const uint8_t *data,
@@ -389,3 +408,4 @@ static bool decode_throttle_position(const uint8_t *data,
 
     return true;
 }
+

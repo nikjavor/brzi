@@ -69,6 +69,7 @@ typedef struct
 
 esp_err_t obd_twai_start(const obd_twai_config_t *);
 bool obd_twai_query_signal(obd_signal_t, obd_decoded_value_t *, TickType_t);
+uint32_t obd_twai_get_rx_drop_count(void);
 
 
 
