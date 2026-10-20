@@ -12,6 +12,7 @@
 static const char *TAG = "OBD_TWAI";
 
 static bool twai_rx_cb(twai_node_handle_t, const twai_rx_done_event_data_t *, void *);
+static bool twai_state_cb(twai_node_handle_t, const twai_state_change_event_data_t *, void *);
 static esp_err_t detect_bitrate(void);
 static void drain_rx_queue();
 static bool send_pid_request(uint8_t, uint8_t);
@@ -28,6 +29,7 @@ static obd_twai_config_t s_config;
 static uint32_t s_detected_bitrate = 0;
 static volatile uint32_t s_rx_count = 0;
 static uint32_t s_rx_drop_count = 0;
+static bool s_recovery_pending = false;
 static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct
@@ -41,6 +43,7 @@ typedef struct
 
 static twai_event_callbacks_t s_twai_cbs = {
     .on_rx_done = twai_rx_cb,
+    .on_state_change = twai_state_cb,
 };
 
 static twai_onchip_node_config_t
@@ -150,13 +153,13 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
     // receive ok, do something here
     s_rx_count++;
 
-    if (s_data_queue == NULL)
+    if (s_data_queue == NULL || rx_frame.header.rtr)
         return false;
 
     twai_rx_item_t item = {
         .id = rx_frame.header.id,
         .ide = rx_frame.header.ide,
-        .len = rx_frame.buffer_len <= 8 ? rx_frame.buffer_len : 8,
+        .len = rx_frame.header.dlc <= 8 ? rx_frame.header.dlc : 8,
     };
 
     memcpy(&item.data, rx_frame.buffer, item.len);
@@ -172,6 +175,18 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
         }
 
     return hp_task_woken == pdTRUE;
+}
+
+static bool twai_state_cb(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
+{
+    if (edata->new_sta == TWAI_ERROR_BUS_OFF)
+    {
+        portENTER_CRITICAL_ISR(&s_stats_lock);
+        s_recovery_pending = true;
+        portEXIT_CRITICAL_ISR(&s_stats_lock);
+    }
+
+    return false;
 }
 
 static bool try_bitrate(uint32_t bitrate)
@@ -290,16 +305,34 @@ static void drain_rx_queue()
 
 static bool send_pid_request(uint8_t service, uint8_t pid)
 {
-    uint8_t send_buff[8] = {0x02, service, pid}; // number of following bytes, service, pid
-    twai_frame_t tx_msg = {
+    // The driver retains both pointers even if the completion wait times out.
+    static uint8_t send_buff[8] = {0x02};
+    static twai_frame_t tx_msg = {
         .header.id = 0x7df,
         .header.ide = false,
         .buffer = send_buff,
         .buffer_len = sizeof(send_buff),
     };
 
+    // Start recovery once per bus-off event, from task context.
+    portENTER_CRITICAL(&s_stats_lock);
+    bool recover = s_recovery_pending;
+    s_recovery_pending = false;
+    portEXIT_CRITICAL(&s_stats_lock);
+
+    if (recover)
+    {
+        esp_err_t err = twai_node_recover(s_node_hdl);
+        if (err != ESP_OK)
+            ESP_LOGW(TAG, "CAN recovery failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
     if (twai_node_transmit_wait_all_done(s_node_hdl, 0) != ESP_OK)
         return false;
+
+    send_buff[1] = service;
+    send_buff[2] = pid;
 
     if (twai_node_transmit(s_node_hdl, &tx_msg, 10) != ESP_OK)
         return false;
