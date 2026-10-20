@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "obd_twai.h"
 
 #include "freertos/FreeRTOS.h"
@@ -16,10 +17,7 @@ static bool twai_state_cb(twai_node_handle_t, const twai_state_change_event_data
 static esp_err_t detect_bitrate(void);
 static void drain_rx_queue();
 static bool send_pid_request(uint8_t, uint8_t);
-static bool wait_response(uint8_t, uint8_t, uint8_t *, size_t *, TickType_t);
-static bool decode_rpm(const uint8_t *, size_t, obd_decoded_value_t *);
-static bool decode_speed(const uint8_t *, size_t, obd_decoded_value_t *);
-static bool decode_throttle_position(const uint8_t *, size_t, obd_decoded_value_t *);
+static bool wait_response(uint8_t, uint8_t, uint8_t *, size_t *, TickType_t, uint32_t *);
 
 static QueueHandle_t s_data_queue = NULL;
 static twai_node_handle_t s_node_hdl = NULL;
@@ -31,6 +29,10 @@ static volatile uint32_t s_rx_count = 0;
 static uint32_t s_rx_drop_count = 0;
 static bool s_recovery_pending = false;
 static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Keep capability bitmaps per responder, so one ECU cannot hide another's PIDs.
+static uint32_t s_supported_pids[8][4];
+static bool s_support_page_known[8][4];
 
 typedef struct
 {
@@ -61,49 +63,6 @@ make_node_config(uint32_t bitrate, bool listen_only)
 
     return cfg;
 }
-
-typedef bool (*obd_decoder_fn_t)(const uint8_t *data,
-                                 size_t len,
-                                 obd_decoded_value_t *out);
-
-typedef struct
-{
-    obd_signal_t signal;
-    uint8_t service;
-    uint8_t pid;
-    uint8_t min_response_len;
-    obd_value_type_t value_type;
-    obd_decoder_fn_t decoder;
-} obd_signal_def_t;
-
-static const obd_signal_def_t obd_signal_defs[OBD_SIGNAL_COUNT] = {
-    [OBD_SIGNAL_RPM] = {
-        .signal = OBD_SIGNAL_RPM,
-        .service = 0x01,
-        .pid = 0x0C,
-        .min_response_len = 5,
-        .value_type = OBD_VALUE_U16,
-        .decoder = decode_rpm,
-    },
-
-    [OBD_SIGNAL_SPEED] = {
-        .signal = OBD_SIGNAL_SPEED,
-        .service = 0x01,
-        .pid = 0x0D,
-        .min_response_len = 4,
-        .value_type = OBD_VALUE_U16,
-        .decoder = decode_speed,
-    },
-
-    [OBD_SIGNAL_THROTTLE_POSITION] = {
-        .signal = OBD_SIGNAL_THROTTLE_POSITION,
-        .service = 0x01,
-        .pid = 0x11,
-        .min_response_len = 4,
-        .value_type = OBD_VALUE_U16,
-        .decoder = decode_throttle_position,
-    },
-};
 
 esp_err_t obd_twai_start(const obd_twai_config_t *config)
 {
@@ -257,15 +216,9 @@ static esp_err_t detect_bitrate(void)
 
 bool obd_twai_query_signal(obd_signal_t signal, obd_decoded_value_t *out, TickType_t timeout)
 {
-    if (out == NULL || signal >= OBD_SIGNAL_COUNT)
-    {
-        return false;
-    }
-
-    // LOOKUP SIGNAL DEFINITION
-    const obd_signal_def_t *def = &obd_signal_defs[signal];
-
-    if (def->decoder == NULL)
+    const obd_signal_info_t *info = obd_signal_get_info(signal);
+    if (out == NULL || info == NULL || s_data_queue == NULL ||
+        obd_twai_signal_support(signal) == OBD_SUPPORT_UNSUPPORTED)
         return false;
 
     uint8_t raw[8];
@@ -275,24 +228,107 @@ bool obd_twai_query_signal(obd_signal_t signal, obd_decoded_value_t *out, TickTy
     drain_rx_queue();
 
     // SEND OBD REQUEST
-    if (!send_pid_request(def->service, def->pid))
+    if (!send_pid_request(0x01, info->pid))
     {
         return false;
     }
 
     // WAIT FOR CORRECT MESSAGE
-    if (!wait_response(def->service, def->pid, raw, &raw_len, timeout))
+    if (!wait_response(0x01, info->pid, raw, &raw_len, timeout, NULL))
     {
         return false;
     }
 
-    if (raw_len < def->min_response_len)
+    return obd_signal_decode(signal, raw, raw_len, out);
+}
+
+obd_support_t obd_twai_signal_support(obd_signal_t signal)
+{
+    const obd_signal_info_t *info = obd_signal_get_info(signal);
+    if (info == NULL)
+        return OBD_SUPPORT_UNSUPPORTED;
+
+    unsigned page = (info->pid - 1u) / 32u;
+    uint32_t bit = UINT32_C(1) << (31u - (info->pid - 1u) % 32u);
+    bool found_ecu = false;
+    bool unknown = false;
+    for (unsigned ecu = 0; ecu < 8; ecu++)
     {
+        if (!s_support_page_known[ecu][0])
+            continue;
+        found_ecu = true;
+        if (!s_support_page_known[ecu][page])
+            unknown = true;
+        else if (s_supported_pids[ecu][page] & bit)
+            return OBD_SUPPORT_SUPPORTED;
+    }
+    return !found_ecu || unknown ? OBD_SUPPORT_UNKNOWN : OBD_SUPPORT_UNSUPPORTED;
+}
+
+bool obd_twai_discover_supported_signals(TickType_t timeout)
+{
+    if (s_data_queue == NULL || timeout == 0)
         return false;
+
+    for (unsigned page = 0; page < 4; page++)
+    {
+        bool found_ecu = false;
+        bool needs_query = false;
+        for (unsigned ecu = 0; ecu < 8; ecu++)
+        {
+            if (!s_support_page_known[ecu][0])
+                continue;
+            found_ecu = true;
+            if (page > 0 && s_support_page_known[ecu][page - 1] &&
+                !(s_supported_pids[ecu][page - 1] & 1u))
+            {
+                s_supported_pids[ecu][page] = 0;
+                s_support_page_known[ecu][page] = true;
+            }
+            if (!s_support_page_known[ecu][page])
+                needs_query = true;
+        }
+        if (found_ecu && !needs_query)
+            continue;
+
+        uint8_t pid = (uint8_t)(page * 32u);
+        drain_rx_queue();
+        if (!send_pid_request(0x01, pid))
+            continue;
+
+        TickType_t start = xTaskGetTickCount();
+        while (1)
+        {
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= timeout)
+                break;
+            uint8_t raw[8];
+            size_t len = 0;
+            uint32_t id = 0;
+            TickType_t remaining = timeout - elapsed;
+            if (!wait_response(0x01, pid, raw, &len, remaining, &id))
+                break;
+            if (len < 7)
+                continue;
+
+            unsigned ecu = id - 0x7E8;
+            s_supported_pids[ecu][page] = ((uint32_t)raw[3] << 24) |
+                ((uint32_t)raw[4] << 16) | ((uint32_t)raw[5] << 8) | raw[6];
+            s_support_page_known[ecu][page] = true;
+        }
     }
 
-    // DECODE VALUE
-    return def->decoder(raw, raw_len, out);
+    bool found_ecu = false;
+    for (unsigned ecu = 0; ecu < 8; ecu++)
+    {
+        if (!s_support_page_known[ecu][0])
+            continue;
+        found_ecu = true;
+        for (unsigned page = 0; page < 4; page++)
+            if (!s_support_page_known[ecu][page])
+                return false;
+    }
+    return found_ecu;
 }
 
 static void drain_rx_queue()
@@ -340,7 +376,8 @@ static bool send_pid_request(uint8_t service, uint8_t pid)
     return twai_node_transmit_wait_all_done(s_node_hdl, 10) == ESP_OK;
 }
 
-static bool wait_response(uint8_t service, uint8_t pid, uint8_t *out, size_t *out_len, TickType_t timeout)
+static bool wait_response(uint8_t service, uint8_t pid, uint8_t *out, size_t *out_len,
+                          TickType_t timeout, uint32_t *responder_id)
 {
     twai_rx_item_t recv_item;
     TickType_t start = xTaskGetTickCount();
@@ -366,14 +403,18 @@ static bool wait_response(uint8_t service, uint8_t pid, uint8_t *out, size_t *ou
 
         const uint8_t *recv_buff = recv_item.data;
 
-        if (recv_buff[1] != (uint8_t)(service + 0x40) ||
+        if (recv_buff[0] < 2 || recv_buff[0] > 7 ||
+            recv_item.len < recv_buff[0] + 1u ||
+            recv_buff[1] != (uint8_t)(service + 0x40) ||
             recv_buff[2] != pid)
         {
             continue;
         }
 
-        memcpy(out, recv_buff, recv_item.len);
-        *out_len = recv_item.len;
+        *out_len = recv_buff[0] + 1u;
+        memcpy(out, recv_buff, *out_len);
+        if (responder_id != NULL)
+            *responder_id = recv_item.id;
 
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, recv_buff, recv_item.len, ESP_LOG_DEBUG);
 
@@ -391,54 +432,3 @@ uint32_t obd_twai_get_rx_drop_count(void)
 
     return count;
 }
-
-static bool decode_rpm(const uint8_t *data,
-                       size_t len,
-                       obd_decoded_value_t *out)
-{
-    if (len < 5)
-    {
-        return false;
-    }
-
-    uint8_t A = data[3];
-    uint8_t B = data[4];
-
-    out->type = OBD_VALUE_U16;
-    out->value.u16 = ((uint16_t)A * 256u + B) / 4u;
-
-    return true;
-}
-static bool decode_speed(const uint8_t *data,
-                         size_t len,
-                         obd_decoded_value_t *out)
-{
-    if (len < 4)
-    {
-        return false;
-    }
-
-    uint8_t A = data[3];
-
-    out->type = OBD_VALUE_U16;
-    out->value.u16 = A;
-
-    return true;
-}
-static bool decode_throttle_position(const uint8_t *data,
-                                     size_t len,
-                                     obd_decoded_value_t *out)
-{
-    if (len < 4)
-    {
-        return false;
-    }
-
-    uint8_t A = data[3];
-
-    out->type = OBD_VALUE_U16;
-    out->value.u16 = ((uint16_t)A * 100u) / 255u;
-
-    return true;
-}
-

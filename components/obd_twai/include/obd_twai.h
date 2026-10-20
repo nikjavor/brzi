@@ -6,6 +6,7 @@
 
 #include "esp_err.h"
 #include "driver/gpio.h"
+#include "obd_signals.h"
 
 typedef struct
 {
@@ -20,42 +21,10 @@ typedef struct
 
 typedef enum
 {
-  OBD_SIGNAL_ENGINE_LOAD,
-  OBD_SIGNAL_COOLANT_TEMP,
-  OBD_SIGNAL_RPM,
-  OBD_SIGNAL_SPEED,
-  OBD_SIGNAL_THROTTLE_POSITION,
-  OBD_SIGNAL_FUEL_LEVEL,
-  OBD_SIGNAL_BAROMETRIC_PRESSURE,
-  OBD_SIGNAL_BATTERY_VOLTAGE,
-  OBD_SIGNAL_RELATIVE_THROTTLE_POSITION,
-  OBD_SIGNAL_AMBIENT_TEMPERATURE,
-  OBD_SIGNAL_THROTTLE_ACTUATOR,
-
-  OBD_SIGNAL_COUNT
-} obd_signal_t;
-
-typedef enum
-{
-  OBD_VALUE_U16,
-  OBD_VALUE_I16,
-  OBD_VALUE_U32,
-  OBD_VALUE_FLOAT,
-} obd_value_type_t;
-
-typedef struct
-{
-  obd_signal_t signal;
-  obd_value_type_t type;
-
-  union
-  {
-    uint16_t u16;
-    int16_t i16;
-    uint32_t u32;
-    float f32;
-  } value;
-} obd_decoded_value_t;
+  OBD_SUPPORT_UNKNOWN,
+  OBD_SUPPORT_SUPPORTED,
+  OBD_SUPPORT_UNSUPPORTED,
+} obd_support_t;
 
 #define OBD_TWAI_DEFAULT_CONFIG() ((obd_twai_config_t){ \
     .tx_gpio = GPIO_NUM_16,                              \
@@ -69,6 +38,9 @@ typedef struct
 
 esp_err_t obd_twai_start(const obd_twai_config_t *);
 bool obd_twai_query_signal(obd_signal_t, obd_decoded_value_t *, TickType_t);
+// Call discovery and queries from the same task. Each support page waits timeout ticks.
+bool obd_twai_discover_supported_signals(TickType_t timeout);
+obd_support_t obd_twai_signal_support(obd_signal_t signal);
 uint32_t obd_twai_get_rx_drop_count(void);
 
 
