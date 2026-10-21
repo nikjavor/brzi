@@ -8,6 +8,7 @@
 #include "obd_twai.h"
 #include "car_data.h"
 #include "obd_scheduler.h"
+#include "ble.h"
 
 static const char *TAG = "MAIN";
 
@@ -19,6 +20,8 @@ void app_main(void)
   ESP_LOGI(TAG, "Start initialization");
 
   car_data_init();
+  
+  ESP_ERROR_CHECK(ble_start());
 
   obd_twai_config_t obd_config = OBD_TWAI_DEFAULT_CONFIG();
   ESP_ERROR_CHECK(obd_twai_start(&obd_config));

@@ -228,6 +228,21 @@ bool car_data_get_snapshot(car_data_t *out)
   return true;
 }
 
+bool car_data_get_values_snapshot(car_value_t out[CAR_DATA_COUNT], uint32_t *captured_ms)
+{
+  if (s_lock == NULL || out == NULL || captured_ms == NULL)
+    return false;
+
+  xSemaphoreTake(s_lock, portMAX_DELAY);
+  *captured_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+  refresh_derived(*captured_ms);
+  for (unsigned i = 0; i < CAR_DATA_COUNT; i++)
+    out[i] = *car_data_get_field((car_data_id_t)i);
+  xSemaphoreGive(s_lock);
+
+  return true;
+}
+
 bool car_data_invalidate(car_data_id_t id)
 {
   car_value_t *field = car_data_get_field(id);

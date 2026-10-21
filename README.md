@@ -77,6 +77,20 @@ These fields are computed when car data is read, using valid, recent inputs:
 
 No derived value is fabricated when its input PIDs are unavailable.
 
+## BLE live telemetry
+
+The device advertises as `BRZI` and accepts one phone without pairing. Subscribe
+to its telemetry characteristic to receive all 35 readings immediately, then every
+100 ms. Values stay in the controller's integer units and include validity and
+sample age. At ATT MTU 247, each complete snapshot uses one 224-byte notification;
+smaller MTUs use fragments. Streaming runs on NimBLE's host event queue and does
+not add another application task or change OBD polling intervals.
+
+See [the BLE protocol](docs/ble-protocol.md) for UUIDs, byte layout, signal IDs,
+phone decoding/reassembly rules, build setup, and hardware acceptance checks.
+`sdkconfig.defaults` enables the peripheral; existing local configurations must
+also enable those settings because saved `sdkconfig` values take precedence.
+
 ## Verification
 
 Run the host tests with a C compiler and Python 3:
@@ -88,9 +102,12 @@ python3 tests/run_host_tests.py
 The tests compile the production code with a simulated SDK and use address and
 undefined-behavior sanitizers. They cover decoding, units and signed values,
 derived calculations, multiple ECU support bitmaps, discovery retries, and a
-40-second scheduler simulation. They do not replace testing on the car.
+40-second scheduler simulation. BLE tests cover byte fixtures, fragmentation,
+subscription/reconnect/reset behavior, and congestion recovery. They do not
+replace testing on the car and physical iOS/Android phones.
 
 Build firmware from an activated ESP-IDF 6.1 environment using `idf.py build`.
+For a new checkout, run `idf.py set-target esp32c6` first.
 
 PID references: [CSS Electronics](https://www.csselectronics.com/pages/obd2-pid-table-on-board-diagnostics-j1979)
 and the [python-OBD command tables](https://python-obd.readthedocs.io/en/latest/Command%20Tables/).
